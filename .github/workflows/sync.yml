@@ -1,4 +1,4 @@
-name: PG Incremental Sync (With Bootstrap)
+name: PG Incremental Sync (Stable)
 
 on:
   schedule:
@@ -43,14 +43,11 @@ jobs:
     - name: Detect first run & changes
       run: |
         mkdir -p last
-
         find new_files -type f | sort > new_list.txt
 
-        # 判断是否是首次运行
         if [ ! -d last ] || [ -z "$(ls -A last)" ]; then
           echo "FIRST_RUN=true" >> $GITHUB_ENV
           find new_files -type f > changed_files.txt
-          echo "First run: full pack"
         else
           find last -type f | sort > old_list.txt
           diff -ruN last new_files > diff.txt || true
@@ -68,13 +65,23 @@ jobs:
           fi
         fi
 
-    - name: Pack pg.zip
+    - name: Pack pg.zip (safe & stable)
       if: env.NO_CHANGE != 'true'
       run: |
         rm -f pg.zip
         cd new_files
-        zip -r ../pg.zip $(cat ../changed_files.txt)
-        cd ..
+
+        # 只打包确实存在的文件
+        while IFS= read -r f; do
+          [ -f "$f" ] && echo "$f"
+        done < ../changed_files.txt > ../valid_files.txt
+
+        if [ -s ../valid_files.txt ]; then
+          zip -r ../pg.zip -@ < ../valid_files.txt
+        else
+          echo "No valid files to pack"
+          echo "NO_CHANGE=true" >> $GITHUB_ENV
+        fi
 
     - name: Update README
       if: env.NO_CHANGE != 'true'
