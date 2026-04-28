@@ -1,90 +1,113 @@
-name: Incremental Sync & Auto Cleanup
+name: PG Incremental Sync (With Bootstrap)
 
 on:
   schedule:
-    # 每30分钟运行一次
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
-  sync-and-pack:
-    runs-on: ubuntu-latest
+  sync:
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-    - name: 1. Checkout Repository
+    - name: Checkout
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.PAT_TOKEN }}
 
-    - name: 2. Fetch Source File List
-      run: |
-        echo "Fetching file list from fish2018/PG..."
-        curl -s "https://api.github.com/repos/fish2018/PG/contents/" | \
-        jq -r '.[].name' | grep '\.zip$' > source_list.txt || true
-        
-        if [ ! -s source_list.txt ]; then
-          touch source_list.txt
-        fi
+    - name: Install tools
+      run: sudo apt-get update && sudo apt-get install -y zip unzip diffutils
 
-    - name: 3. Detect New Files
+    - name: Fetch latest zip list
       run: |
-        mkdir -p downloads
-        touch local_list.txt
+        curl -s https://api.github.com/repos/fish2018/PG/contents/ \
+        | jq -r '.[].name' | grep '\.zip$' > new_zips.txt
 
-        # 找出源库有但本地没有的文件（增量）
-        NEW_FILES=$(comm -13 <(sort local_list.txt) <(sort source_list.txt))
-        
-        if [ -z "$NEW_FILES" ]; then
-          echo "✅ No new files. Nothing to do."
-          echo "HAS_NEW=false" >> $GITHUB_ENV
+    - name: Download new zips
+      run: |
+        mkdir -p new
+        while read zip; do
+          echo "Download $zip"
+          wget -q "https://raw.githubusercontent.com/fish2018/PG/main/$zip" -O "new/$zip"
+        done < new_zips.txt
+
+    - name: Extract (keep directory structure)
+      run: |
+        mkdir -p new_files
+        for z in new/*.zip; do
+          unzip -o "$z" -d new_files >/dev/null || true
+        done
+
+    - name: Detect first run & changes
+      run: |
+        mkdir -p last
+
+        find new_files -type f | sort > new_list.txt
+
+        # 判断是否是首次运行
+        if [ ! -d last ] || [ -z "$(ls -A last)" ]; then
+          echo "FIRST_RUN=true" >> $GITHUB_ENV
+          find new_files -type f > changed_files.txt
+          echo "First run: full pack"
         else
-          echo "🆕 New files detected:"
-          echo "$NEW_FILES"
-          echo "$NEW_FILES" > new_files.txt
-          echo "HAS_NEW=true" >> $GITHUB_ENV
+          find last -type f | sort > old_list.txt
+          diff -ruN last new_files > diff.txt || true
+
+          grep '^+++ ' diff.txt \
+          | grep -v '/dev/null' \
+          | awk '{print $2}' \
+          | sed 's|^new_files/||' \
+          > changed_files.txt
+
+          if [ -s changed_files.txt ]; then
+            echo "FIRST_RUN=false" >> $GITHUB_ENV
+          else
+            echo "NO_CHANGE=true" >> $GITHUB_ENV
+          fi
         fi
 
-    - name: 4. Download New Files
-      if: env.HAS_NEW == 'true'
+    - name: Pack pg.zip
+      if: env.NO_CHANGE != 'true'
       run: |
-        while IFS= read -r file; do
-          if [ -n "$file" ]; then
-            echo "Downloading $file ..."
-            # 下载到 downloads 文件夹，保留原文件名
-            wget -q "https://raw.githubusercontent.com/fish2018/PG/main/$file" -O "downloads/$file"
-          fi
-        done < new_files.txt
+        rm -f pg.zip
+        cd new_files
+        zip -r ../pg.zip $(cat ../changed_files.txt)
+        cd ..
 
-    - name: 5. Pack into pg.zip (Incremental)
-      if: env.HAS_NEW == 'true'
+    - name: Update README
+      if: env.NO_CHANGE != 'true'
       run: |
-        echo "Packaging new files into pg.zip..."
-        # 如果仓库里已有 pg.zip，先解压出来（为了合并，虽然通常是新增）
-        # 这里我们直接打包 downloads 里的所有东西
-        # 注意：如果只想包含新增的，直接打包 downloads 目录即可
-        zip -j pg.zip downloads/*
-        echo "Package size: $(du -h pg.zip)"
+        echo "# PG Incremental Sync" > README.md
+        echo "" >> README.md
+        echo "Last update: $(date -u '+%Y-%m-%d %H:%M UTC')" >> README.md
+        echo "" >> README.md
 
-    - name: 6. Cleanup Old Zips (Older than 7 days)
-      run: |
-        echo "Cleaning up old pg.zip files..."
-        # 查找当前目录下修改时间在7天前的 pg.zip 文件并删除
-        # 注意：这里只删除以 pg.zip 结尾的，或者特定的日期命名文件
-        # 为了安全，我们删除当前目录下的旧 pg.zip（如果存在历史遗留）
-        find . -maxdepth 1 -name "pg.zip" -mtime +7 -delete || true
-        echo "Cleanup done."
+        if [ "${FIRST_RUN}" = "true" ]; then
+          echo "## Initial Full Package" >> README.md
+        else
+          echo "## Updated Files" >> README.md
+        fi
 
-    - name: 7. Commit and Push
-      if: env.HAS_NEW == 'true'
+        echo "" >> README.md
+        echo "| Path |" >> README.md
+        echo "|------|" >> README.md
+        cat changed_files.txt | while read f; do
+          echo "| \`$f\` |" >> README.md
+        done
+
+    - name: Rotate snapshot
+      if: env.NO_CHANGE != 'true'
       run: |
-        # 更新本地记录，防止下次重复下载
-        cat source_list.txt > local_list.txt
-        
-        git config --global user.name 'GitHub Actions'
-        git config --global user.email 'actions@github.com'
-        
-        git add pg.zip local_list.txt
-        git commit -m "Update: Added $(wc -l < new_files.txt) new file(s). [$(date +'%Y-%m-%d')]"
-        git push origin main
+        rm -rf last
+        mv new_files last
+
+    - name: Commit & Push
+      if: env.NO_CHANGE != 'true'
+      run: |
+        git config user.name "github-actions"
+        git config user.email "actions@github.com"
+        git add pg.zip README.md last
+        git commit -m "PG sync: $(wc -l < changed_files.txt) files"
+        git push
